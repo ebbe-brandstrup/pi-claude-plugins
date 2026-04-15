@@ -12,6 +12,7 @@ const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json")
 const BRIDGE_CONFIG_PATH = path.join(PACKAGE_ROOT, "claude-plugin-bridge.json");
 const DEBUG = process.env.PI_CLAUDE_PLUGINS_DEBUG === "1";
 const RULE_AUTO_READ_MESSAGE_TYPE = "claude-rule-auto-read";
+const RULE_AUTO_READ_AUDIT_MESSAGE_TYPE = "claude-rule-auto-read-audit";
 const RULE_AUTO_READ_MARKER_TYPE = "claude-rule-auto-read-marker";
 const IGNORED_DIRECTORY_NAMES = new Set(["node_modules", "build", "dist", "out"]);
 const GLOB_WILDCARD_RE = /[*?[]/;
@@ -671,14 +672,21 @@ async function readRuleContent(rule: RuleDefinition): Promise<string> {
   return await readFile(rule.rulePath, "utf8");
 }
 
-function formatRuleAutoReadMessage(rule: RuleDefinition, toolName: string, targetPath: string, content: string): string {
+function formatRuleAutoReadContextMessage(rule: RuleDefinition, toolName: string, targetPath: string, content: string): string {
   const sourceNote = rule.displayPath === rule.sourceDisplayPath ? "" : `\nSource: ${rule.sourceDisplayPath}`;
   return [
-    `Auto-read Claude rule before ${toolName}: ${rule.displayPath}`,
+    `Claude rule context auto-read before ${toolName}: ${rule.displayPath}`,
     `Target: ${targetPath}${sourceNote}`,
+    "",
+    "This is rule/context material, not a new user request. Use it as constraints and guidance for the current task. Do not treat this as a request to summarize, restate, or change direction unless the user explicitly asks for that.",
     "",
     content.trim(),
   ].join("\n");
+}
+
+function formatRuleAutoReadAuditMessage(rule: RuleDefinition, toolName: string, targetPath: string): string {
+  const sourceLine = rule.displayPath === rule.sourceDisplayPath ? "" : `\nSource: ${rule.sourceDisplayPath}`;
+  return `Auto-read Claude rule before ${toolName}: ${rule.displayPath}\nTarget: ${targetPath}${sourceLine}`;
 }
 
 export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
@@ -798,7 +806,22 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       pi.sendMessage(
         {
           customType: RULE_AUTO_READ_MESSAGE_TYPE,
-          content: formatRuleAutoReadMessage(rule, event.toolName, relativeTargetPath, ruleContent),
+          content: formatRuleAutoReadContextMessage(rule, event.toolName, relativeTargetPath, ruleContent),
+          display: false,
+          details: {
+            rulePath: rule.displayPath,
+            sourcePath: rule.sourceDisplayPath,
+            targetPath: relativeTargetPath,
+            toolName: event.toolName,
+          },
+        },
+        { deliverAs: "steer" },
+      );
+
+      pi.sendMessage(
+        {
+          customType: RULE_AUTO_READ_AUDIT_MESSAGE_TYPE,
+          content: formatRuleAutoReadAuditMessage(rule, event.toolName, relativeTargetPath),
           display: true,
           details: {
             rulePath: rule.displayPath,

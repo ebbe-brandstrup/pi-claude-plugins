@@ -195,10 +195,11 @@ On startup and on `/reload`, the extension:
 
 For Claude rules, the extension also intercepts `read`, `edit`, and `write` tool calls. If a target path matches a rule's frontmatter `paths` globs, the extension:
 
-1. emits one chat-visible message per matched rule file
-2. injects the rule markdown into context
-3. blocks the current file operation once
-4. lets the agent retry with the rules already in context
+1. emits one chat-visible audit message per matched rule file
+2. injects the rule markdown into model context as a hidden context message
+3. explicitly frames that injected content as rule/context material rather than a new user request
+4. blocks the current file operation once
+5. lets the agent retry with the rules already in context
 
 Rule auto-reads are deduplicated per active branch, so rewinding to earlier history can re-trigger them when appropriate.
 
