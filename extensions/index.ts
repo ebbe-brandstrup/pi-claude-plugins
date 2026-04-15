@@ -1,4 +1,5 @@
-import { access, readFile, readdir, realpath, stat } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +11,7 @@ const USER_CLAUDE_COMMANDS_DIR = path.join(os.homedir(), ".claude", "commands");
 const INSTALLED_PLUGINS_PATH = path.join(os.homedir(), ".claude", "plugins", "installed_plugins.json");
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
 const BRIDGE_CONFIG_PATH = path.join(PACKAGE_ROOT, "claude-plugin-bridge.json");
+const SANITIZED_PROMPTS_DIR = path.join(os.tmpdir(), "pi-claude-plugins", "prompts");
 const DEBUG = process.env.PI_CLAUDE_PLUGINS_DEBUG === "1";
 const RULE_AUTO_READ_MESSAGE_TYPE = "claude-rule-auto-read";
 const RULE_AUTO_READ_AUDIT_MESSAGE_TYPE = "claude-rule-auto-read-audit";
@@ -225,6 +227,80 @@ function getPromptResourceNames(entryPath: string): string[] {
   const fileName = path.basename(entryPath);
   const resourceName = path.basename(entryPath, ".md");
   return fileName === resourceName ? [resourceName] : [resourceName, fileName];
+}
+
+function extractFrontmatter(content: string): { frontmatter: string | null; body: string } {
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  if (!normalized.startsWith("---\n")) {
+    return { frontmatter: null, body: normalized };
+  }
+
+  const endIndex = normalized.indexOf("\n---", 4);
+  if (endIndex === -1) {
+    return { frontmatter: null, body: normalized };
+  }
+
+  return {
+    frontmatter: normalized.slice(4, endIndex),
+    body: normalized.slice(endIndex + 4).trimStart(),
+  };
+}
+
+function parseSimpleFrontmatterValue(value: string): string {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function buildSanitizedPromptTemplate(rawContent: string): string {
+  const { frontmatter, body } = extractFrontmatter(rawContent);
+  if (frontmatter == null) {
+    return rawContent;
+  }
+
+  let description: string | undefined;
+  let argumentHint: string | undefined;
+
+  for (const line of frontmatter.split("\n")) {
+    const descriptionMatch = line.match(/^description:\s*(.*)$/);
+    if (descriptionMatch) {
+      description = parseSimpleFrontmatterValue(descriptionMatch[1]);
+      continue;
+    }
+
+    const argumentHintMatch = line.match(/^argument-hint:\s*(.*)$/);
+    if (argumentHintMatch) {
+      argumentHint = parseSimpleFrontmatterValue(argumentHintMatch[1]);
+    }
+  }
+
+  const sanitizedLines = ["---"];
+  if (description && description.length > 0) {
+    sanitizedLines.push(`description: ${JSON.stringify(description)}`);
+  }
+  if (argumentHint && argumentHint.length > 0) {
+    sanitizedLines.push(`argument-hint: ${JSON.stringify(argumentHint)}`);
+  }
+  sanitizedLines.push("---", "", body);
+
+  return `${sanitizedLines.join("\n").replace(/\n+$/, "")}\n`;
+}
+
+async function sanitizePromptTemplatePath(filePath: string): Promise<string> {
+  const rawContent = await readFile(filePath, "utf8");
+  const sanitizedContent = buildSanitizedPromptTemplate(rawContent);
+  const sourceHash = crypto.createHash("sha1").update(normalizePath(filePath)).digest("hex").slice(0, 12);
+  const targetDir = path.join(SANITIZED_PROMPTS_DIR, sourceHash);
+  const targetPath = path.join(targetDir, path.basename(filePath));
+
+  await mkdir(targetDir, { recursive: true });
+  await writeFile(targetPath, sanitizedContent, "utf8");
+  return targetPath;
 }
 
 function getStandaloneSkillResourceNames(entryPath: string): string[] {
@@ -634,7 +710,7 @@ async function findResources(cwd: string): Promise<DiscoveredResources> {
 
   return {
     skillPaths: [...new Set(discovered.skillPaths)],
-    promptPaths: [...new Set(discovered.promptPaths)],
+    promptPaths: await Promise.all([...new Set(discovered.promptPaths)].map((promptPath) => sanitizePromptTemplatePath(promptPath))),
   };
 }
 

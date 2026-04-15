@@ -39,6 +39,8 @@ The extension also loads command markdown files from:
 
 These are returned to pi as `promptPaths`, so they show up like pi prompt templates / slash commands.
 
+Before exposing Claude commands to pi, the extension writes sanitized temporary copies with pi-compatible frontmatter. This preserves Claude-specific command files while avoiding prompt-template parse failures from Claude-only frontmatter syntax.
+
 ### Claude rules
 
 The extension scans project Claude rules from:
