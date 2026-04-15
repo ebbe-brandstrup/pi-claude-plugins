@@ -3,14 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
-const MARKETPLACES_DIR = path.join(os.homedir(), ".claude", "plugins", "marketplaces");
 const INSTALLED_PLUGINS_PATH = path.join(os.homedir(), ".claude", "plugins", "installed_plugins.json");
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
+const DEBUG = process.env.PI_CLAUDE_PLUGINS_DEBUG === "1";
 const IGNORED_DIRECTORY_NAMES = new Set(["node_modules", "build", "dist", "out"]);
 
 type InstalledPluginEntry = {
   scope?: string;
   projectPath?: string;
+  installPath?: string;
 };
 
 type InstalledPluginsFile = {
@@ -37,22 +38,6 @@ async function readEntries(dir: string) {
   }
 }
 
-async function readDirectories(dir: string): Promise<string[]> {
-  const entries = await readEntries(dir);
-
-  return entries
-    .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink() && !shouldIgnoreEntry(entry.name, true))
-    .map((entry) => path.join(dir, entry.name));
-}
-
-async function readMarkdownFiles(dir: string): Promise<string[]> {
-  const entries = await readEntries(dir);
-
-  return entries
-    .filter((entry) => entry.isFile() && !shouldIgnoreEntry(entry.name, false) && entry.name.endsWith(".md"))
-    .map((entry) => path.join(dir, entry.name));
-}
-
 async function fileExists(filePath: string): Promise<boolean> {
   try {
     await access(filePath);
@@ -61,6 +46,43 @@ async function fileExists(filePath: string): Promise<boolean> {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") return false;
     throw error;
+  }
+}
+
+async function walkInstallPath(dir: string, resources: DiscoveredResources): Promise<void> {
+  const entries = await readEntries(dir);
+
+  for (const entry of entries) {
+    const entryPath = path.join(dir, entry.name);
+
+    if (entry.isSymbolicLink()) {
+      continue;
+    }
+
+    if (entry.isDirectory()) {
+      if (shouldIgnoreEntry(entry.name, true)) {
+        continue;
+      }
+
+      await walkInstallPath(entryPath, resources);
+      continue;
+    }
+
+    if (shouldIgnoreEntry(entry.name, false)) {
+      continue;
+    }
+
+    if (entry.name === "SKILL.md") {
+      const parentDir = path.dirname(entryPath);
+      if (path.basename(path.dirname(parentDir)) === "skills") {
+        resources.skillPaths.push(entryPath);
+      }
+      continue;
+    }
+
+    if (entry.name.endsWith(".md") && path.basename(path.dirname(entryPath)) === "commands") {
+      resources.promptPaths.push(entryPath);
+    }
   }
 }
 
@@ -87,13 +109,13 @@ async function loadPluginEnabledStates(): Promise<Record<string, boolean>> {
   return parsed.enabledPlugins ?? {};
 }
 
-async function loadEnabledPluginKeys(cwd: string): Promise<Set<string>> {
+async function loadEnabledPluginInstallPaths(cwd: string): Promise<string[]> {
   let raw: string;
   try {
     raw = await readFile(INSTALLED_PLUGINS_PATH, "utf8");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT") return new Set();
+    if (code === "ENOENT") return [];
     throw error;
   }
 
@@ -101,7 +123,7 @@ async function loadEnabledPluginKeys(cwd: string): Promise<Set<string>> {
   const plugins = parsed.plugins ?? {};
   const pluginEnabledStates = await loadPluginEnabledStates();
   const normalizedCwd = normalizePath(cwd);
-  const enabled = new Set<string>();
+  const enabledInstallPaths = new Set<string>();
 
   for (const [pluginKey, entries] of Object.entries(plugins)) {
     if (pluginEnabledStates[pluginKey] === false) {
@@ -110,21 +132,24 @@ async function loadEnabledPluginKeys(cwd: string): Promise<Set<string>> {
 
     if (!Array.isArray(entries)) continue;
 
-    const isEnabledForCwd = entries.some((entry) => {
-      if (!entry || typeof entry !== "object") return false;
-      if (entry.scope === "user") return true;
-      if (entry.scope === "project" && typeof entry.projectPath === "string") {
-        return isSameOrDescendant(normalizePath(entry.projectPath), normalizedCwd);
-      }
-      return true;
-    });
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") continue;
+      if (typeof entry.installPath !== "string" || entry.installPath.length === 0) continue;
 
-    if (isEnabledForCwd) {
-      enabled.add(pluginKey);
+      const isEnabledForCwd =
+        entry.scope === "user" ||
+        (entry.scope === "project" &&
+          typeof entry.projectPath === "string" &&
+          isSameOrDescendant(normalizePath(entry.projectPath), normalizedCwd)) ||
+        entry.scope == null;
+
+      if (isEnabledForCwd) {
+        enabledInstallPaths.add(path.resolve(entry.installPath));
+      }
     }
   }
 
-  return enabled;
+  return [...enabledInstallPaths];
 }
 
 type DiscoveredResources = {
@@ -133,57 +158,37 @@ type DiscoveredResources = {
 };
 
 async function findResources(cwd: string): Promise<DiscoveredResources> {
-  const enabledPluginKeys = await loadEnabledPluginKeys(cwd);
-  const marketplaceDirs = await readDirectories(MARKETPLACES_DIR);
-  const skillPaths: string[] = [];
-  const promptPaths: string[] = [];
+  const installPaths = await loadEnabledPluginInstallPaths(cwd);
+  const discovered: DiscoveredResources = {
+    skillPaths: [],
+    promptPaths: [],
+  };
 
-  for (const marketplaceDir of marketplaceDirs) {
-    const marketplaceName = path.basename(marketplaceDir);
-    const marketplacePluginKey = `${marketplaceName}@${marketplaceName}`;
-
-    const topLevelSkillDirs = await readDirectories(path.join(marketplaceDir, "skills"));
-    for (const skillDir of topLevelSkillDirs) {
-      const pluginKey = `${path.basename(skillDir)}@${marketplaceName}`;
-      if (!enabledPluginKeys.has(pluginKey)) {
-        continue;
-      }
-
-      const skillPath = path.join(skillDir, "SKILL.md");
-      if (await fileExists(skillPath)) {
-        skillPaths.push(skillPath);
-      }
+  for (const installPath of installPaths) {
+    if (!(await fileExists(installPath))) {
+      continue;
     }
 
-    if (enabledPluginKeys.has(marketplacePluginKey)) {
-      promptPaths.push(...(await readMarkdownFiles(path.join(marketplaceDir, "commands"))));
-    }
-
-    const pluginDirs = await readDirectories(path.join(marketplaceDir, "plugins"));
-    for (const pluginDir of pluginDirs) {
-      const pluginKey = `${path.basename(pluginDir)}@${marketplaceName}`;
-      if (!enabledPluginKeys.has(pluginKey)) {
-        continue;
-      }
-
-      const pluginSkillDirs = await readDirectories(path.join(pluginDir, "skills"));
-      for (const skillDir of pluginSkillDirs) {
-        const skillPath = path.join(skillDir, "SKILL.md");
-        if (await fileExists(skillPath)) {
-          skillPaths.push(skillPath);
-        }
-      }
-
-      promptPaths.push(...(await readMarkdownFiles(path.join(pluginDir, "commands"))));
-    }
+    await walkInstallPath(installPath, discovered);
   }
 
-  return { skillPaths, promptPaths };
+  return {
+    skillPaths: [...new Set(discovered.skillPaths)],
+    promptPaths: [...new Set(discovered.promptPaths)],
+  };
 }
 
 export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
   async function discoverResources(cwd: string): Promise<DiscoveredResources> {
+    const installPaths = await loadEnabledPluginInstallPaths(cwd);
     const resources = await findResources(cwd);
+
+    if (DEBUG) {
+      console.log(
+        `[claude-marketplace-skills] Scanning ${installPaths.length} enabled Claude plugin install path${installPaths.length === 1 ? "" : "s"}: ${installPaths.length > 0 ? installPaths.join(", ") : "(none)"}\n`,
+      );
+    }
+
     return {
       skillPaths: resources.skillPaths.sort((a, b) => a.localeCompare(b)),
       promptPaths: resources.promptPaths.sort((a, b) => a.localeCompare(b)),
@@ -202,8 +207,8 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       const promptCount = resources.promptPaths.length;
       const message =
         skillCount > 0 || promptCount > 0
-          ? `[claude-marketplace-skills] Loaded ${skillCount} skill file${skillCount === 1 ? "" : "s"} and ${promptCount} command file${promptCount === 1 ? "" : "s"} from ${MARKETPLACES_DIR}`
-          : `[claude-marketplace-skills] No enabled skill or command files found under ${MARKETPLACES_DIR}`;
+          ? `[claude-marketplace-skills] Loaded ${skillCount} skill file${skillCount === 1 ? "" : "s"} and ${promptCount} command file${promptCount === 1 ? "" : "s"} from enabled Claude plugin install paths`
+          : `[claude-marketplace-skills] No enabled skill or command files found in enabled Claude plugin install paths`;
 
       console.log(`${message}\n`);
       if (ctx.hasUI) {

@@ -1,8 +1,8 @@
 # pi-claude-plugins
 
-A [pi](https://github.com/badlogic/pi-mono) extension that imports **enabled Claude marketplace plugin skills and commands** into the current pi session.
+A [pi](https://github.com/badlogic/pi-mono) extension that imports **enabled Claude plugin skills and commands** into the current pi session.
 
-It bridges Claude's plugin marketplace layout into pi by exposing:
+It bridges Claude plugins into pi by exposing:
 
 - **skills** as pi skills
 - **command markdown files** as pi prompt templates / slash commands
@@ -16,19 +16,17 @@ The extension only loads plugins that are currently enabled in Claude after chec
 
 ### Skills
 
-The extension loads skill files from these locations:
+The extension reads enabled plugin `installPath` values from `~/.claude/plugins/installed_plugins.json` and loads any skill files matching:
 
-- `~/.claude/plugins/marketplaces/*/skills/*/SKILL.md`
-- `~/.claude/plugins/marketplaces/*/plugins/*/skills/*/SKILL.md`
+- `**/skills/*/SKILL.md`
 
 These are returned to pi as `skillPaths` through the `resources_discover` hook.
 
 ### Command markdown files
 
-The extension also loads command markdown files from these locations:
+The extension also loads command markdown files under enabled plugin install paths matching:
 
-- `~/.claude/plugins/marketplaces/*/commands/*.md`
-- `~/.claude/plugins/marketplaces/*/plugins/*/commands/*.md`
+- `**/commands/*.md`
 
 These are returned to pi as `promptPaths`, so they show up like pi prompt templates / slash commands.
 
@@ -78,51 +76,14 @@ Claude's installed plugins file uses keys like:
 - `frontend-design@claude-plugins-official`
 - `playwright-cli@playwright-cli`
 
-This extension maps marketplace paths to those keys as follows.
+This extension uses `installed_plugins.json` as the source of truth. If a plugin key is enabled for the current scope, the extension scans that install entry's `installPath` directly.
 
-#### Top-level marketplace skills
+This makes it work for:
 
-For:
-
-- `~/.claude/plugins/marketplaces/<marketplace>/skills/<plugin>/SKILL.md`
-
-it checks whether this plugin key is enabled:
-
-- `<plugin>@<marketplace>`
-
-#### Nested plugin skills
-
-For:
-
-- `~/.claude/plugins/marketplaces/<marketplace>/plugins/<plugin>/skills/<skill>/SKILL.md`
-
-it checks whether this plugin key is enabled:
-
-- `<plugin>@<marketplace>`
-
-#### Top-level marketplace commands
-
-For:
-
-- `~/.claude/plugins/marketplaces/<marketplace>/commands/*.md`
-
-it checks whether this marketplace-level plugin key is enabled:
-
-- `<marketplace>@<marketplace>`
-
-This matches layouts like:
-
-- `~/.claude/plugins/marketplaces/planning-with-files/commands/*.md`
-
-#### Nested plugin commands
-
-For:
-
-- `~/.claude/plugins/marketplaces/<marketplace>/plugins/<plugin>/commands/*.md`
-
-it checks whether this plugin key is enabled:
-
-- `<plugin>@<marketplace>`
+- official marketplace plugins
+- git-based or private marketplaces
+- cached plugin installs
+- project-scoped installs with nonstandard marketplace directory names
 
 ## Scope rules
 
@@ -155,7 +116,7 @@ On startup and on `/reload`, the extension:
 1. reads `~/.claude/plugins/installed_plugins.json`
 2. reads `~/.claude/settings.json`
 3. determines which Claude plugins are enabled for the current pi cwd
-4. scans the supported skill and command locations
+4. scans each enabled plugin install path for supported skill and command files
 5. filters out anything not enabled or explicitly disabled
 6. returns the remaining files to pi via `resources_discover`
 
@@ -171,7 +132,7 @@ Even when a file exists on disk, it will not be loaded if:
 - the plugin is not present / enabled in `installed_plugins.json`
 - the plugin is explicitly disabled in `~/.claude/settings.json`
 - the plugin is project-scoped for a different project
-- the file is outside the supported path patterns
+- the file is outside the supported `skills/*/SKILL.md` or `commands/*.md` path patterns within the installed plugin
 - the file is inside a hidden/ignored directory
 
 ## Skill collisions and validation warnings
