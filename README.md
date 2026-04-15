@@ -1,11 +1,12 @@
 # pi-claude-plugins
 
-A [pi](https://github.com/badlogic/pi-mono) extension that imports **enabled Claude plugin resources and Claude skill folders** into the current pi session.
+A [pi](https://github.com/badlogic/pi-mono) extension that imports **enabled Claude plugin resources, Claude skills, Claude commands, and Claude path rules** into the current pi session.
 
 It bridges Claude resources into pi by exposing:
 
 - **skills** as pi skills
 - **command markdown files** as pi prompt templates / slash commands
+- **Claude rules** as deterministic pre-read context for matching file paths
 
 The extension only loads plugins that are currently enabled in Claude after checking both:
 
@@ -30,11 +31,32 @@ These are returned to pi as `skillPaths` through the `resources_discover` hook.
 
 ### Command markdown files
 
-The extension also loads command markdown files under enabled plugin install paths matching:
+The extension also loads command markdown files from:
 
-- `**/commands/*.md`
+- enabled plugin install paths: `**/commands/*.md`
+- user Claude commands: `~/.claude/commands/*.md`
+- project Claude commands: `<cwd>/.claude/commands/*.md`
 
 These are returned to pi as `promptPaths`, so they show up like pi prompt templates / slash commands.
+
+### Claude rules
+
+The extension scans project Claude rules from:
+
+- `<cwd>/.claude/rules/**/*.md`
+
+Rule files can be symlinked files. Their markdown frontmatter may declare:
+
+```yaml
+paths:
+  - "flow/**/*.py"
+  - "tests/**"
+```
+
+When the model uses `read`, `edit`, or `write` on a matching file path, the extension auto-reads each matching rule into context before the file operation proceeds.
+
+- rule file discovery and frontmatter path indexing refresh on `/reload`
+- rule markdown content itself is read fresh at trigger time, so content-only edits do not require `/reload`
 
 ## Install
 
@@ -127,7 +149,7 @@ Example:
 
 - explicit allow beats explicit deny
 - plugin filtering happens before resource discovery within that plugin install
-- resource filtering applies to discovered `skills/*/SKILL.md` and `commands/*.md`
+- resource filtering applies to discovered skills, commands, and Claude rule filenames
 
 ## Scope rules
 
@@ -149,9 +171,12 @@ The extension intentionally ignores:
 - `build/`
 - `dist/`
 - `out/`
-- symlinked directories/files
+- symlinked directories
+- symlinked files during plugin / skill / command discovery
 
-This avoids duplicate, generated, or unrelated content being imported.
+Exception: project Claude rule files under `.claude/rules/` may be symlinked files and are followed intentionally.
+
+This avoids duplicate, generated, or unrelated content being imported while still supporting symlink-based rule workflows.
 
 ## Runtime behavior
 
@@ -163,8 +188,19 @@ On startup and on `/reload`, the extension:
 4. loads `claude-plugin-bridge.json` from the package root
 5. scans each enabled plugin install path for supported skill and command files
 6. scans standalone Claude skill folders from `~/.claude/skills` and `<cwd>/.claude/skills`
-7. filters out anything blocked by Claude settings or the bridge config
-8. returns the remaining files to pi via `resources_discover`
+7. scans standalone Claude command folders from `~/.claude/commands` and `<cwd>/.claude/commands`
+8. indexes project Claude rule files from `<cwd>/.claude/rules`
+9. filters out anything blocked by Claude settings or the bridge config
+10. returns the remaining skills / commands to pi via `resources_discover`
+
+For Claude rules, the extension also intercepts `read`, `edit`, and `write` tool calls. If a target path matches a rule's frontmatter `paths` globs, the extension:
+
+1. emits one chat-visible message per matched rule file
+2. injects the rule markdown into context
+3. blocks the current file operation once
+4. lets the agent retry with the rules already in context
+
+Rule auto-reads are deduplicated per active branch, so rewinding to earlier history can re-trigger them when appropriate.
 
 The extension also prints and notifies a summary like:
 
@@ -180,8 +216,10 @@ Even when a file exists on disk, it will not be loaded if:
 - the plugin is project-scoped for a different project
 - the file is outside the supported `skills/*/SKILL.md` or `commands/*.md` path patterns within an installed plugin
 - the standalone Claude skill is outside `~/.claude/skills/*/SKILL.md` or `<cwd>/.claude/skills/*/SKILL.md`
+- the standalone Claude command is outside `~/.claude/commands/*.md` or `<cwd>/.claude/commands/*.md`
 - the file is blocked by `claude-plugin-bridge.json`
 - the file is inside a hidden/ignored directory
+- a Claude rule exists but its `paths` globs do not match the file being read or modified
 
 ## Skill collisions and validation warnings
 
@@ -198,10 +236,13 @@ These warnings come from pi's skill loader, not from this extension itself.
 ## Limitations
 
 - This extension does not execute Claude plugin hooks or plugin runtime logic
-- It only imports filesystem resources that map cleanly into pi:
+- It imports filesystem resources that map cleanly into pi:
   - skills (`SKILL.md`)
   - command markdown files (`*.md` in `commands/`)
+  - project Claude rules (`.claude/rules/**/*.md`) as extension-managed context injections
 - It does not import arbitrary plugin code, agents, hooks, or non-markdown command formats
+- Claude rule auto-read currently triggers only for `read`, `edit`, and `write` tool calls
+- It does not attempt to infer rule triggers from `bash`, `grep`, `find`, or `ls`
 - It does not import or bridge Claude plugin MCP integrations / MCP servers
 
 ## When to reload
@@ -215,6 +256,12 @@ Run `/reload` in pi after:
 - installing or updating Claude plugins
 - adding or removing skill / command markdown files in installed Claude plugins
 - adding or removing standalone skills under `~/.claude/skills` or project `.claude/skills`
+- adding or removing standalone commands under `~/.claude/commands` or project `.claude/commands`
+- editing project Claude rules under `<cwd>/.claude/rules`
+
+Rule of thumb:
+- changed rule file set, symlinks, or frontmatter `paths` → run `/reload`
+- changed only rule body content → no reload needed; the next trigger reads the latest file contents
 
 ## Files
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-claude-plugins",
   "version": "0.1.4",
-  "description": "Pi extension that exposes enabled Claude plugin skills and commands into the current pi session.",
+  "description": "Pi extension that bridges enabled Claude plugins, skills, commands, and path rules into the current pi session.",
   "author": "Ross Z",
   "license": "MIT",
   "repository": {
