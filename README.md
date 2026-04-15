@@ -203,7 +203,7 @@ For Claude rules, the extension also intercepts `read`, `edit`, and `write` tool
 4. blocks the current file operation once
 5. lets the agent retry with the rules already in context
 
-Rule auto-reads are deduplicated per active branch, so rewinding to earlier history can re-trigger them when appropriate.
+Rule auto-reads are deduplicated per active branch, so rewinding to earlier history can re-trigger them when appropriate. If the model later tries to `read` a rule file that was already auto-read in the current branch, the extension blocks that redundant read and points back to the already-applied rule paths.
 
 The extension also prints and notifies a summary like:
 

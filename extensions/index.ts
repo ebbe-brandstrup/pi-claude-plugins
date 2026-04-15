@@ -727,8 +727,8 @@ function getTargetPathFromToolCall(event: ToolCallEvent): string | undefined {
   return rawPath.replace(/^@/, "");
 }
 
-function getAppliedRulePathsFromBranch(sessionManager: { getBranch(): unknown[] }): Set<string> {
-  const applied = new Set<string>();
+function getAppliedRuleMarkersFromBranch(sessionManager: { getBranch(): unknown[] }): RuleAutoReadMarker[] {
+  const applied: RuleAutoReadMarker[] = [];
 
   for (const entry of sessionManager.getBranch() as Array<Record<string, unknown>>) {
     if (entry?.type !== "custom" || entry.customType !== RULE_AUTO_READ_MARKER_TYPE) {
@@ -736,8 +736,16 @@ function getAppliedRulePathsFromBranch(sessionManager: { getBranch(): unknown[] 
     }
 
     const data = entry.data as RuleAutoReadMarker | undefined;
-    if (data && typeof data.ruleRealPath === "string") {
-      applied.add(normalizePath(data.ruleRealPath));
+    if (
+      data &&
+      typeof data.ruleRealPath === "string" &&
+      typeof data.rulePath === "string" &&
+      typeof data.sourcePath === "string"
+    ) {
+      applied.push({
+        ...data,
+        ruleRealPath: normalizePath(data.ruleRealPath),
+      });
     }
   }
 
@@ -861,14 +869,27 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       return;
     }
 
+    const appliedRuleMarkers = getAppliedRuleMarkersFromBranch(ctx.sessionManager);
+    const appliedRuleRealPaths = new Set(appliedRuleMarkers.map((marker) => marker.ruleRealPath));
+
+    const redundantRuleReads = appliedRuleMarkers.filter(
+      (marker) => absoluteTargetPath === normalizePath(path.resolve(ctx.cwd, marker.rulePath)) || absoluteTargetPath === normalizePath(path.resolve(ctx.cwd, marker.sourcePath)),
+    );
+    if (event.toolName === "read" && redundantRuleReads.length > 0) {
+      const ruleLines = redundantRuleReads.map((marker) => `- ${marker.rulePath}`).join("\n");
+      return {
+        block: true,
+        reason: `This Claude rule file was already auto-read into context for the current branch:\n${ruleLines}\n\nDo not re-read it unless the user explicitly asks.`,
+      };
+    }
+
     const matchingRules = getMatchingRules(activeRuleIndex, relativeTargetPath);
     if (matchingRules.length === 0) {
       return;
     }
 
-    const appliedRulePaths = getAppliedRulePathsFromBranch(ctx.sessionManager);
     const rulesToInject = matchingRules.filter(
-      (rule) => !appliedRulePaths.has(rule.realPath) && !currentTurnPendingRulePaths.has(rule.realPath),
+      (rule) => !appliedRuleRealPaths.has(rule.realPath) && !currentTurnPendingRulePaths.has(rule.realPath),
     );
 
     if (rulesToInject.length === 0) {
@@ -928,9 +949,10 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       );
     }
 
+    const injectedRuleLines = rulesToInject.map((rule) => `- ${rule.displayPath}`).join("\n");
     return {
       block: true,
-      reason: `Auto-read ${rulesToInject.length} Claude rule file${rulesToInject.length === 1 ? "" : "s"} for ${relativeTargetPath}. Retry now that the rule${rulesToInject.length === 1 ? " is" : "s are"} in context.`,
+      reason: `Auto-read Claude rules for ${relativeTargetPath}:\n${injectedRuleLines}\n\nRetry now that these rules are already in context. Do not re-read them unless the user explicitly asks.`,
     };
   });
 }
