@@ -1,10 +1,13 @@
 import { access, readFile, readdir } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALLED_PLUGINS_PATH = path.join(os.homedir(), ".claude", "plugins", "installed_plugins.json");
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
+const BRIDGE_CONFIG_PATH = path.join(PACKAGE_ROOT, "claude-plugin-bridge.json");
 const DEBUG = process.env.PI_CLAUDE_PLUGINS_DEBUG === "1";
 const IGNORED_DIRECTORY_NAMES = new Set(["node_modules", "build", "dist", "out"]);
 
@@ -20,6 +23,34 @@ type InstalledPluginsFile = {
 
 type ClaudeSettingsFile = {
   enabledPlugins?: Record<string, boolean>;
+};
+
+type BridgeMode = "allow-all" | "deny-all";
+
+type BridgeConfigFile = {
+  mode?: BridgeMode;
+  allowPlugins?: string[];
+  denyPlugins?: string[];
+  allowResources?: string[];
+  denyResources?: string[];
+};
+
+type BridgeConfig = {
+  mode: BridgeMode;
+  allowPlugins: Set<string>;
+  denyPlugins: Set<string>;
+  allowResources: Set<string>;
+  denyResources: Set<string>;
+};
+
+type EnabledPluginInstall = {
+  pluginKey: string;
+  installPath: string;
+};
+
+type DiscoveredResources = {
+  skillPaths: string[];
+  promptPaths: string[];
 };
 
 function shouldIgnoreEntry(name: string, isDirectory: boolean): boolean {
@@ -49,7 +80,75 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-async function walkInstallPath(dir: string, resources: DiscoveredResources): Promise<void> {
+function normalizeConfigValues(values: string[] | undefined): Set<string> {
+  return new Set(
+    (values ?? [])
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0),
+  );
+}
+
+async function loadBridgeConfig(): Promise<BridgeConfig> {
+  let raw: string;
+  try {
+    raw = await readFile(BRIDGE_CONFIG_PATH, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      return {
+        mode: "allow-all",
+        allowPlugins: new Set(),
+        denyPlugins: new Set(),
+        allowResources: new Set(),
+        denyResources: new Set(),
+      };
+    }
+    throw error;
+  }
+
+  const parsed = JSON.parse(raw) as BridgeConfigFile;
+  return {
+    mode: parsed.mode === "deny-all" ? "deny-all" : "allow-all",
+    allowPlugins: normalizeConfigValues(parsed.allowPlugins),
+    denyPlugins: normalizeConfigValues(parsed.denyPlugins),
+    allowResources: normalizeConfigValues(parsed.allowResources),
+    denyResources: normalizeConfigValues(parsed.denyResources),
+  };
+}
+
+function matchesAny(candidates: Iterable<string>, values: Set<string>): boolean {
+  for (const candidate of candidates) {
+    if (values.has(candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isAllowed(candidates: Iterable<string>, allow: Set<string>, deny: Set<string>, mode: BridgeMode): boolean {
+  if (matchesAny(candidates, allow)) {
+    return true;
+  }
+
+  if (matchesAny(candidates, deny)) {
+    return false;
+  }
+
+  return mode === "allow-all";
+}
+
+function getPromptResourceNames(entryPath: string): string[] {
+  const fileName = path.basename(entryPath);
+  const resourceName = path.basename(entryPath, ".md");
+  return fileName === resourceName ? [resourceName] : [resourceName, fileName];
+}
+
+async function walkInstallPath(
+  dir: string,
+  config: BridgeConfig,
+  resources: DiscoveredResources,
+): Promise<void> {
   const entries = await readEntries(dir);
 
   for (const entry of entries) {
@@ -64,7 +163,7 @@ async function walkInstallPath(dir: string, resources: DiscoveredResources): Pro
         continue;
       }
 
-      await walkInstallPath(entryPath, resources);
+      await walkInstallPath(entryPath, config, resources);
       continue;
     }
 
@@ -75,13 +174,18 @@ async function walkInstallPath(dir: string, resources: DiscoveredResources): Pro
     if (entry.name === "SKILL.md") {
       const parentDir = path.dirname(entryPath);
       if (path.basename(path.dirname(parentDir)) === "skills") {
-        resources.skillPaths.push(entryPath);
+        const resourceName = path.basename(parentDir);
+        if (isAllowed([resourceName], config.allowResources, config.denyResources, config.mode)) {
+          resources.skillPaths.push(entryPath);
+        }
       }
       continue;
     }
 
     if (entry.name.endsWith(".md") && path.basename(path.dirname(entryPath)) === "commands") {
-      resources.promptPaths.push(entryPath);
+      if (isAllowed(getPromptResourceNames(entryPath), config.allowResources, config.denyResources, config.mode)) {
+        resources.promptPaths.push(entryPath);
+      }
     }
   }
 }
@@ -109,7 +213,7 @@ async function loadPluginEnabledStates(): Promise<Record<string, boolean>> {
   return parsed.enabledPlugins ?? {};
 }
 
-async function loadEnabledPluginInstallPaths(cwd: string): Promise<string[]> {
+async function loadEnabledPluginInstalls(cwd: string): Promise<EnabledPluginInstall[]> {
   let raw: string;
   try {
     raw = await readFile(INSTALLED_PLUGINS_PATH, "utf8");
@@ -123,7 +227,7 @@ async function loadEnabledPluginInstallPaths(cwd: string): Promise<string[]> {
   const plugins = parsed.plugins ?? {};
   const pluginEnabledStates = await loadPluginEnabledStates();
   const normalizedCwd = normalizePath(cwd);
-  const enabledInstallPaths = new Set<string>();
+  const enabledInstalls = new Map<string, EnabledPluginInstall>();
 
   for (const [pluginKey, entries] of Object.entries(plugins)) {
     if (pluginEnabledStates[pluginKey] === false) {
@@ -144,32 +248,32 @@ async function loadEnabledPluginInstallPaths(cwd: string): Promise<string[]> {
         entry.scope == null;
 
       if (isEnabledForCwd) {
-        enabledInstallPaths.add(path.resolve(entry.installPath));
+        const installPath = path.resolve(entry.installPath);
+        enabledInstalls.set(`${pluginKey}:${installPath}`, { pluginKey, installPath });
       }
     }
   }
 
-  return [...enabledInstallPaths];
+  return [...enabledInstalls.values()];
 }
 
-type DiscoveredResources = {
-  skillPaths: string[];
-  promptPaths: string[];
-};
-
 async function findResources(cwd: string): Promise<DiscoveredResources> {
-  const installPaths = await loadEnabledPluginInstallPaths(cwd);
+  const [enabledInstalls, config] = await Promise.all([loadEnabledPluginInstalls(cwd), loadBridgeConfig()]);
   const discovered: DiscoveredResources = {
     skillPaths: [],
     promptPaths: [],
   };
 
-  for (const installPath of installPaths) {
+  for (const { pluginKey, installPath } of enabledInstalls) {
+    if (!isAllowed([pluginKey], config.allowPlugins, config.denyPlugins, config.mode)) {
+      continue;
+    }
+
     if (!(await fileExists(installPath))) {
       continue;
     }
 
-    await walkInstallPath(installPath, discovered);
+    await walkInstallPath(installPath, config, discovered);
   }
 
   return {
@@ -180,12 +284,18 @@ async function findResources(cwd: string): Promise<DiscoveredResources> {
 
 export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
   async function discoverResources(cwd: string): Promise<DiscoveredResources> {
-    const installPaths = await loadEnabledPluginInstallPaths(cwd);
-    const resources = await findResources(cwd);
+    const [enabledInstalls, config, resources] = await Promise.all([
+      loadEnabledPluginInstalls(cwd),
+      loadBridgeConfig(),
+      findResources(cwd),
+    ]);
 
     if (DEBUG) {
+      const scannedInstalls = enabledInstalls.filter(({ pluginKey }) =>
+        isAllowed([pluginKey], config.allowPlugins, config.denyPlugins, config.mode),
+      );
       console.log(
-        `[claude-marketplace-skills] Scanning ${installPaths.length} enabled Claude plugin install path${installPaths.length === 1 ? "" : "s"}: ${installPaths.length > 0 ? installPaths.join(", ") : "(none)"}\n`,
+        `[claude-marketplace-skills] Bridge config ${BRIDGE_CONFIG_PATH} (${config.mode}); scanning ${scannedInstalls.length} enabled Claude plugin install path${scannedInstalls.length === 1 ? "" : "s"}: ${scannedInstalls.length > 0 ? scannedInstalls.map(({ pluginKey, installPath }) => `${pluginKey} => ${installPath}`).join(", ") : "(none)"}\n`,
       );
     }
 

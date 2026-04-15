@@ -12,6 +12,10 @@ The extension only loads plugins that are currently enabled in Claude after chec
 - `~/.claude/plugins/installed_plugins.json`
 - `~/.claude/settings.json`
 
+It can also filter bridged plugins and resources with a package-local config file:
+
+- `claude-plugin-bridge.json`
+
 ## What gets loaded
 
 ### Skills
@@ -33,13 +37,13 @@ These are returned to pi as `promptPaths`, so they show up like pi prompt templa
 ## Install
 
 ```bash
-pi install npm:pi-claude-plugin
+pi install npm:pi-claude-plugins
 ```
 
 ## Remove
 
 ```bash
-pi remove npm:pi-claude-plugin
+pi remove npm:pi-claude-plugins
 ```
 
 ## How plugin enablement works
@@ -76,7 +80,7 @@ Claude's installed plugins file uses keys like:
 - `frontend-design@claude-plugins-official`
 - `playwright-cli@playwright-cli`
 
-This extension uses `installed_plugins.json` as the source of truth. If a plugin key is enabled for the current scope, the extension scans that install entry's `installPath` directly.
+This extension uses `installed_plugins.json` as the source of truth. If a plugin key is enabled for the current scope, the extension scans that install entry's `installPath` directly, then applies any filters from `claude-plugin-bridge.json`.
 
 This makes it work for:
 
@@ -84,6 +88,44 @@ This makes it work for:
 - git-based or private marketplaces
 - cached plugin installs
 - project-scoped installs with nonstandard marketplace directory names
+
+## Bridge config
+
+You can commit a `claude-plugin-bridge.json` file in the package root to whitelist or blacklist bridged Claude plugins and individual resources.
+
+Example:
+
+```json
+{
+  "mode": "allow-all",
+  "allowPlugins": [],
+  "denyPlugins": ["superpowers@claude-plugins-official"],
+  "allowResources": [],
+  "denyResources": ["subagent-driven-development"]
+}
+```
+
+### Config fields
+
+- `mode`
+  - `allow-all` → load everything by default, then apply deny lists
+  - `deny-all` → load nothing by default, then only load explicit allow-list matches
+- `allowPlugins`
+  - plugin keys such as `in-the-loop-tools@in-the-loop-tools`
+- `denyPlugins`
+  - plugin keys such as `superpowers@claude-plugins-official`
+- `allowResources`
+  - skill names like `brainstorming`
+  - command names like `gc`
+  - command filenames like `gc.md`
+- `denyResources`
+  - same matching rules as `allowResources`
+
+### Precedence
+
+- explicit allow beats explicit deny
+- plugin filtering happens before resource discovery within that plugin install
+- resource filtering applies to discovered `skills/*/SKILL.md` and `commands/*.md`
 
 ## Scope rules
 
@@ -116,9 +158,10 @@ On startup and on `/reload`, the extension:
 1. reads `~/.claude/plugins/installed_plugins.json`
 2. reads `~/.claude/settings.json`
 3. determines which Claude plugins are enabled for the current pi cwd
-4. scans each enabled plugin install path for supported skill and command files
-5. filters out anything not enabled or explicitly disabled
-6. returns the remaining files to pi via `resources_discover`
+4. loads `claude-plugin-bridge.json` from the package root
+5. scans each enabled plugin install path for supported skill and command files
+6. filters out anything blocked by Claude settings or the bridge config
+7. returns the remaining files to pi via `resources_discover`
 
 The extension also prints and notifies a summary like:
 
@@ -160,16 +203,18 @@ These warnings come from pi's skill loader, not from this extension itself.
 
 Run `/reload` in pi after:
 
+- editing `claude-plugin-bridge.json`
 - enabling or disabling Claude plugins
 - changing `~/.claude/plugins/installed_plugins.json`
 - changing `~/.claude/settings.json`
-- installing/removing marketplace plugins
-- adding/removing skills or command markdown files in the marketplace directories
+- installing or updating Claude plugins
+- adding or removing skill / command markdown files in installed Claude plugins
 
 ## Files
 
 - Extension entry point: `extensions/index.ts`
 - Package manifest: `package.json`
+- Bridge config: `claude-plugin-bridge.json`
 
 ## License
 
