@@ -1,8 +1,8 @@
 # pi-claude-plugins
 
-A [pi](https://github.com/badlogic/pi-mono) extension that imports **enabled Claude plugin skills and commands** into the current pi session.
+A [pi](https://github.com/badlogic/pi-mono) extension that imports **enabled Claude plugin resources and Claude skill folders** into the current pi session.
 
-It bridges Claude plugins into pi by exposing:
+It bridges Claude resources into pi by exposing:
 
 - **skills** as pi skills
 - **command markdown files** as pi prompt templates / slash commands
@@ -20,9 +20,11 @@ It can also filter bridged plugins and resources with a package-local config fil
 
 ### Skills
 
-The extension reads enabled plugin `installPath` values from `~/.claude/plugins/installed_plugins.json` and loads any skill files matching:
+The extension loads skill files from both enabled Claude plugin install paths and standalone Claude skill folders matching:
 
-- `**/skills/*/SKILL.md`
+- enabled plugin install paths: `**/skills/*/SKILL.md`
+- user Claude skills: `~/.claude/skills/*/SKILL.md`
+- project Claude skills: `<cwd>/.claude/skills/*/SKILL.md`
 
 These are returned to pi as `skillPaths` through the `resources_discover` hook.
 
@@ -160,8 +162,9 @@ On startup and on `/reload`, the extension:
 3. determines which Claude plugins are enabled for the current pi cwd
 4. loads `claude-plugin-bridge.json` from the package root
 5. scans each enabled plugin install path for supported skill and command files
-6. filters out anything blocked by Claude settings or the bridge config
-7. returns the remaining files to pi via `resources_discover`
+6. scans standalone Claude skill folders from `~/.claude/skills` and `<cwd>/.claude/skills`
+7. filters out anything blocked by Claude settings or the bridge config
+8. returns the remaining files to pi via `resources_discover`
 
 The extension also prints and notifies a summary like:
 
@@ -175,7 +178,9 @@ Even when a file exists on disk, it will not be loaded if:
 - the plugin is not present / enabled in `installed_plugins.json`
 - the plugin is explicitly disabled in `~/.claude/settings.json`
 - the plugin is project-scoped for a different project
-- the file is outside the supported `skills/*/SKILL.md` or `commands/*.md` path patterns within the installed plugin
+- the file is outside the supported `skills/*/SKILL.md` or `commands/*.md` path patterns within an installed plugin
+- the standalone Claude skill is outside `~/.claude/skills/*/SKILL.md` or `<cwd>/.claude/skills/*/SKILL.md`
+- the file is blocked by `claude-plugin-bridge.json`
 - the file is inside a hidden/ignored directory
 
 ## Skill collisions and validation warnings
@@ -209,6 +214,7 @@ Run `/reload` in pi after:
 - changing `~/.claude/settings.json`
 - installing or updating Claude plugins
 - adding or removing skill / command markdown files in installed Claude plugins
+- adding or removing standalone skills under `~/.claude/skills` or project `.claude/skills`
 
 ## Files
 

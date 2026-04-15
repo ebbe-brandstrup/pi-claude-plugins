@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const USER_CLAUDE_SKILLS_DIR = path.join(os.homedir(), ".claude", "skills");
 const INSTALLED_PLUGINS_PATH = path.join(os.homedir(), ".claude", "plugins", "installed_plugins.json");
 const CLAUDE_SETTINGS_PATH = path.join(os.homedir(), ".claude", "settings.json");
 const BRIDGE_CONFIG_PATH = path.join(PACKAGE_ROOT, "claude-plugin-bridge.json");
@@ -190,6 +191,29 @@ async function walkInstallPath(
   }
 }
 
+async function discoverStandaloneClaudeSkillsDir(
+  skillsDir: string,
+  config: BridgeConfig,
+  resources: DiscoveredResources,
+): Promise<void> {
+  const entries = await readEntries(skillsDir);
+
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.isSymbolicLink() || shouldIgnoreEntry(entry.name, true)) {
+      continue;
+    }
+
+    const skillPath = path.join(skillsDir, entry.name, "SKILL.md");
+    if (!(await fileExists(skillPath))) {
+      continue;
+    }
+
+    if (isAllowed([entry.name], config.allowResources, config.denyResources, config.mode)) {
+      resources.skillPaths.push(skillPath);
+    }
+  }
+}
+
 function normalizePath(value: string): string {
   const normalized = path.resolve(value).replace(/\\/g, "/");
   return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
@@ -197,6 +221,10 @@ function normalizePath(value: string): string {
 
 function isSameOrDescendant(parent: string, target: string): boolean {
   return target === parent || target.startsWith(`${parent}/`);
+}
+
+function getProjectClaudeSkillsDir(cwd: string): string {
+  return path.join(path.resolve(cwd), ".claude", "skills");
 }
 
 async function loadPluginEnabledStates(): Promise<Record<string, boolean>> {
@@ -276,6 +304,17 @@ async function findResources(cwd: string): Promise<DiscoveredResources> {
     await walkInstallPath(installPath, config, discovered);
   }
 
+  const standaloneSkillDirs = [USER_CLAUDE_SKILLS_DIR, getProjectClaudeSkillsDir(cwd)];
+  const uniqueStandaloneSkillDirs = [...new Set(standaloneSkillDirs.map((dir) => path.resolve(dir)))];
+
+  for (const skillsDir of uniqueStandaloneSkillDirs) {
+    if (!(await fileExists(skillsDir))) {
+      continue;
+    }
+
+    await discoverStandaloneClaudeSkillsDir(skillsDir, config, discovered);
+  }
+
   return {
     skillPaths: [...new Set(discovered.skillPaths)],
     promptPaths: [...new Set(discovered.promptPaths)],
@@ -294,8 +333,10 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       const scannedInstalls = enabledInstalls.filter(({ pluginKey }) =>
         isAllowed([pluginKey], config.allowPlugins, config.denyPlugins, config.mode),
       );
+      const standaloneSkillDirs = [USER_CLAUDE_SKILLS_DIR, getProjectClaudeSkillsDir(cwd)];
+      const uniqueStandaloneSkillDirs = [...new Set(standaloneSkillDirs.map((dir) => path.resolve(dir)))];
       console.log(
-        `[claude-marketplace-skills] Bridge config ${BRIDGE_CONFIG_PATH} (${config.mode}); scanning ${scannedInstalls.length} enabled Claude plugin install path${scannedInstalls.length === 1 ? "" : "s"}: ${scannedInstalls.length > 0 ? scannedInstalls.map(({ pluginKey, installPath }) => `${pluginKey} => ${installPath}`).join(", ") : "(none)"}\n`,
+        `[claude-marketplace-skills] Bridge config ${BRIDGE_CONFIG_PATH} (${config.mode}); scanning ${scannedInstalls.length} enabled Claude plugin install path${scannedInstalls.length === 1 ? "" : "s"}: ${scannedInstalls.length > 0 ? scannedInstalls.map(({ pluginKey, installPath }) => `${pluginKey} => ${installPath}`).join(", ") : "(none)"}; standalone Claude skill dirs: ${uniqueStandaloneSkillDirs.join(", ")}\n`,
       );
     }
 
@@ -317,8 +358,8 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       const promptCount = resources.promptPaths.length;
       const message =
         skillCount > 0 || promptCount > 0
-          ? `[claude-marketplace-skills] Loaded ${skillCount} skill file${skillCount === 1 ? "" : "s"} and ${promptCount} command file${promptCount === 1 ? "" : "s"} from enabled Claude plugin install paths`
-          : `[claude-marketplace-skills] No enabled skill or command files found in enabled Claude plugin install paths`;
+          ? `[claude-marketplace-skills] Loaded ${skillCount} skill file${skillCount === 1 ? "" : "s"} and ${promptCount} command file${promptCount === 1 ? "" : "s"} from Claude plugins and skills`
+          : `[claude-marketplace-skills] No enabled skill or command files found in Claude plugins or skills`;
 
       console.log(`${message}\n`);
       if (ctx.hasUI) {
