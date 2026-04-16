@@ -999,9 +999,10 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
           ? `[claude-marketplace-skills] Loaded ${skillCount} skill file${skillCount === 1 ? "" : "s"} and ${promptCount} command file${promptCount === 1 ? "" : "s"} from Claude plugins, skills, and commands`
           : `[claude-marketplace-skills] No enabled skill or command files found in Claude plugins, skills, or commands`;
 
-      console.log(`${message}\n`);
       if (ctx.hasUI) {
         ctx.ui.notify(message, skillCount > 0 || promptCount > 0 ? "success" : "warning");
+      } else {
+        console.log(`${message}\n`);
       }
 
       if (DEBUG) {
@@ -1013,9 +1014,10 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       }
     } catch (error) {
       const message = `[claude-marketplace-skills] Failed to discover resources: ${(error as Error).message}`;
-      console.log(`${message}\n`);
       if (ctx.hasUI) {
         ctx.ui.notify(message, "error");
+      } else {
+        console.log(`${message}\n`);
       }
     }
   });
@@ -1075,9 +1077,10 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       }
     } catch (error) {
       const message = `[claude-marketplace-skills] Failed to expand Claude context file references: ${(error as Error).message}`;
-      console.log(`${message}\n`);
       if (ctx.hasUI) {
         ctx.ui.notify(message, "warning");
+      } else {
+        console.log(`${message}\n`);
       }
     }
   });
