@@ -1072,9 +1072,6 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
         });
       }
 
-      if (ctx.hasUI) {
-        ctx.ui.notify(`Auto-read Claude context references: ${filesToInject.map((file) => file.displayPath).join(", ")}`, "info");
-      }
     } catch (error) {
       const message = `[claude-marketplace-skills] Failed to expand Claude context file references: ${(error as Error).message}`;
       if (ctx.hasUI) {
@@ -1186,9 +1183,6 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
         targetPath: relativeTargetPath,
       });
 
-      if (ctx.hasUI) {
-        ctx.ui.notify(`Auto-read Claude rule: ${rule.displayPath}`, "info");
-      }
     }
 
     if (DEBUG) {
