@@ -16,9 +16,9 @@ const DEBUG = process.env.PI_CLAUDE_PLUGINS_DEBUG === "1";
 const RULE_AUTO_READ_MESSAGE_TYPE = "claude-rule-auto-read";
 const RULE_AUTO_READ_AUDIT_MESSAGE_TYPE = "claude-rule-auto-read-audit";
 const RULE_AUTO_READ_MARKER_TYPE = "claude-rule-auto-read-marker";
-const CONTEXT_REFERENCE_AUTO_READ_MESSAGE_TYPE = "claude-context-reference-auto-read";
-const CONTEXT_REFERENCE_AUTO_READ_AUDIT_MESSAGE_TYPE = "claude-context-reference-auto-read-audit";
-const CONTEXT_REFERENCE_AUTO_READ_MARKER_TYPE = "claude-context-reference-auto-read-marker";
+const CONTEXT_REFERENCE_AUTO_READ_MESSAGE_TYPE = "context-reference-auto-read";
+const CONTEXT_REFERENCE_AUTO_READ_AUDIT_MESSAGE_TYPE = "context-reference-auto-read-audit";
+const CONTEXT_REFERENCE_AUTO_READ_MARKER_TYPE = "context-reference-auto-read-marker";
 const IGNORED_DIRECTORY_NAMES = new Set(["node_modules", "build", "dist", "out"]);
 const GLOB_WILDCARD_RE = /[*?[]/;
 
