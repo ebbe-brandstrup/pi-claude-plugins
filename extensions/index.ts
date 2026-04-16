@@ -16,6 +16,9 @@ const DEBUG = process.env.PI_CLAUDE_PLUGINS_DEBUG === "1";
 const RULE_AUTO_READ_MESSAGE_TYPE = "claude-rule-auto-read";
 const RULE_AUTO_READ_AUDIT_MESSAGE_TYPE = "claude-rule-auto-read-audit";
 const RULE_AUTO_READ_MARKER_TYPE = "claude-rule-auto-read-marker";
+const CONTEXT_REFERENCE_AUTO_READ_MESSAGE_TYPE = "claude-context-reference-auto-read";
+const CONTEXT_REFERENCE_AUTO_READ_AUDIT_MESSAGE_TYPE = "claude-context-reference-auto-read-audit";
+const CONTEXT_REFERENCE_AUTO_READ_MARKER_TYPE = "claude-context-reference-auto-read-marker";
 const IGNORED_DIRECTORY_NAMES = new Set(["node_modules", "build", "dist", "out"]);
 const GLOB_WILDCARD_RE = /[*?[]/;
 
@@ -87,6 +90,27 @@ type RuleAutoReadMarker = {
   sourcePath: string;
   triggeredByTool: string;
   targetPath: string;
+};
+
+type ContextReferenceSource = {
+  path: string;
+  realPath: string;
+  displayPath: string;
+};
+
+type ContextReferenceFile = {
+  path: string;
+  realPath: string;
+  displayPath: string;
+  sourcePath: string;
+  sourceDisplayPath: string;
+  content: string;
+};
+
+type ContextReferenceAutoReadMarker = {
+  referenceRealPath: string;
+  referencePath: string;
+  sourcePath: string;
 };
 
 function shouldIgnoreEntry(name: string, isDirectory: boolean): boolean {
@@ -320,6 +344,11 @@ function getProjectClaudeRulesDir(cwd: string): string {
   return path.join(path.resolve(cwd), ".claude", "rules");
 }
 
+function getContextFileCandidates(cwd: string): string[] {
+  const projectRoot = path.resolve(cwd);
+  return [path.join(projectRoot, "AGENTS.md"), path.join(projectRoot, "CLAUDE.md")];
+}
+
 function isSameOrDescendant(parent: string, target: string): boolean {
   return target === parent || target.startsWith(`${parent}/`);
 }
@@ -334,6 +363,34 @@ function formatDisplayPath(filePath: string, cwd: string): string {
   }
 
   return normalizedFilePath;
+}
+
+function parseAtReferences(content: string): string[] {
+  const references = new Set<string>();
+  const matches = content.matchAll(/(^|[\s(])@([^\s)\]>"'`,;:!?]+)/gm);
+
+  for (const match of matches) {
+    const reference = match[2]?.trim();
+    if (!reference || reference.startsWith("@")) {
+      continue;
+    }
+    references.add(reference);
+  }
+
+  return [...references];
+}
+
+function resolveContextReferencePath(reference: string, projectRoot: string): string {
+  if (path.isAbsolute(reference)) {
+    return normalizePath(reference);
+  }
+
+  if (reference.startsWith("~/")) {
+    return normalizePath(path.join(os.homedir(), reference.slice(2)));
+  }
+
+  const relativeReference = normalizeRelativePath(reference);
+  return normalizePath(path.resolve(projectRoot, relativeReference));
 }
 
 async function walkInstallPath(
@@ -756,6 +813,124 @@ async function readRuleContent(rule: RuleDefinition): Promise<string> {
   return await readFile(rule.rulePath, "utf8");
 }
 
+async function discoverContextReferenceSources(cwd: string): Promise<ContextReferenceSource[]> {
+  const projectRoot = normalizePath(cwd);
+  const candidates = getContextFileCandidates(projectRoot);
+  const sources: ContextReferenceSource[] = [];
+  const seenRealPaths = new Set<string>();
+
+  for (const candidate of candidates) {
+    if (!(await fileExists(candidate))) {
+      continue;
+    }
+
+    const realCandidatePath = normalizePath(await realpath(candidate));
+    if (seenRealPaths.has(realCandidatePath)) {
+      continue;
+    }
+
+    seenRealPaths.add(realCandidatePath);
+    sources.push({
+      path: normalizePath(candidate),
+      realPath: realCandidatePath,
+      displayPath: formatDisplayPath(candidate, cwd),
+    });
+  }
+
+  return sources;
+}
+
+async function discoverContextReferenceFiles(cwd: string): Promise<ContextReferenceFile[]> {
+  const sources = await discoverContextReferenceSources(cwd);
+  const references: ContextReferenceFile[] = [];
+  const visitedRealPaths = new Set<string>(sources.map((source) => source.realPath));
+  const queue = [...sources];
+
+  while (queue.length > 0) {
+    const source = queue.shift()!;
+    const content = await readFile(source.path, "utf8");
+
+    for (const reference of parseAtReferences(content)) {
+      const resolvedPath = resolveContextReferencePath(reference, cwd);
+      if (!isSameOrDescendant(normalizePath(cwd), resolvedPath)) {
+        continue;
+      }
+      if (!(await fileExists(resolvedPath))) {
+        continue;
+      }
+
+      const realReferencePath = normalizePath(await realpath(resolvedPath));
+      if (visitedRealPaths.has(realReferencePath)) {
+        continue;
+      }
+
+      visitedRealPaths.add(realReferencePath);
+      const referenceContent = await readFile(resolvedPath, "utf8");
+      const referenceFile: ContextReferenceFile = {
+        path: resolvedPath,
+        realPath: realReferencePath,
+        displayPath: formatDisplayPath(resolvedPath, cwd),
+        sourcePath: source.path,
+        sourceDisplayPath: source.displayPath,
+        content: referenceContent,
+      };
+      references.push(referenceFile);
+      queue.push({
+        path: resolvedPath,
+        realPath: realReferencePath,
+        displayPath: referenceFile.displayPath,
+      });
+    }
+  }
+
+  return references;
+}
+
+function getAppliedContextReferenceMarkersFromBranch(sessionManager: { getBranch(): unknown[] }): ContextReferenceAutoReadMarker[] {
+  const applied: ContextReferenceAutoReadMarker[] = [];
+
+  for (const entry of sessionManager.getBranch() as Array<Record<string, unknown>>) {
+    if (entry?.type !== "custom" || entry.customType !== CONTEXT_REFERENCE_AUTO_READ_MARKER_TYPE) {
+      continue;
+    }
+
+    const data = entry.data as ContextReferenceAutoReadMarker | undefined;
+    if (
+      data &&
+      typeof data.referenceRealPath === "string" &&
+      typeof data.referencePath === "string" &&
+      typeof data.sourcePath === "string"
+    ) {
+      applied.push({
+        ...data,
+        referenceRealPath: normalizePath(data.referenceRealPath),
+      });
+    }
+  }
+
+  return applied;
+}
+
+function formatContextReferenceAutoReadContextMessage(files: ContextReferenceFile[]): string {
+  const sections = files.map((file) => {
+    const sourceLine = file.displayPath === file.sourceDisplayPath ? "" : `\nReferenced from: ${file.sourceDisplayPath}`;
+    return [`Context file reference auto-read: ${file.displayPath}${sourceLine}`, "", file.content.trim()].join("\n");
+  });
+
+  return [
+    "Claude context file references were auto-read before this turn.",
+    "",
+    "This is context material, not a new user request. The full contents of the referenced files are already loaded below; use them as project instructions and supporting context. Do not re-read those files unless the user explicitly asks.",
+    "",
+    ...sections,
+  ].join("\n");
+}
+
+function formatContextReferenceAutoReadAuditMessage(files: ContextReferenceFile[]): string {
+  const lines = files.map((file) => `- ${file.displayPath}`);
+  return `Auto-read Claude context file references:\n${lines.join("\n")}`;
+}
+
 function formatRuleAutoReadContextMessage(rule: RuleDefinition, toolName: string, targetPath: string, content: string): string {
   const sourceNote = rule.displayPath === rule.sourceDisplayPath ? "" : `\nSource: ${rule.sourceDisplayPath}`;
   return [
@@ -849,6 +1024,64 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
     return await discoverResources(event.cwd);
   });
 
+  pi.on("before_agent_start", async (_event, ctx) => {
+    try {
+      const referencedFiles = await discoverContextReferenceFiles(ctx.cwd);
+      if (referencedFiles.length === 0) {
+        return;
+      }
+
+      const appliedReferenceMarkers = getAppliedContextReferenceMarkersFromBranch(ctx.sessionManager);
+      const appliedReferenceRealPaths = new Set(appliedReferenceMarkers.map((marker) => marker.referenceRealPath));
+      const filesToInject = referencedFiles.filter((file) => !appliedReferenceRealPaths.has(file.realPath));
+      if (filesToInject.length === 0) {
+        return;
+      }
+
+      pi.sendMessage(
+        {
+          customType: CONTEXT_REFERENCE_AUTO_READ_MESSAGE_TYPE,
+          content: formatContextReferenceAutoReadContextMessage(filesToInject),
+          display: false,
+          details: {
+            paths: filesToInject.map((file) => file.displayPath),
+          },
+        },
+        { deliverAs: "steer" },
+      );
+
+      pi.sendMessage(
+        {
+          customType: CONTEXT_REFERENCE_AUTO_READ_AUDIT_MESSAGE_TYPE,
+          content: formatContextReferenceAutoReadAuditMessage(filesToInject),
+          display: true,
+          details: {
+            paths: filesToInject.map((file) => file.displayPath),
+          },
+        },
+        { deliverAs: "steer" },
+      );
+
+      for (const file of filesToInject) {
+        pi.appendEntry<ContextReferenceAutoReadMarker>(CONTEXT_REFERENCE_AUTO_READ_MARKER_TYPE, {
+          referenceRealPath: file.realPath,
+          referencePath: file.displayPath,
+          sourcePath: file.sourceDisplayPath,
+        });
+      }
+
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Auto-read Claude context references: ${filesToInject.map((file) => file.displayPath).join(", ")}`, "info");
+      }
+    } catch (error) {
+      const message = `[claude-marketplace-skills] Failed to expand Claude context file references: ${(error as Error).message}`;
+      console.log(`${message}\n`);
+      if (ctx.hasUI) {
+        ctx.ui.notify(message, "warning");
+      }
+    }
+  });
+
   pi.on("turn_start", async () => {
     currentTurnPendingRulePaths = new Set();
   });
@@ -867,6 +1100,18 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
     const relativeTargetPath = normalizeRelativePath(path.relative(ctx.cwd, absoluteTargetPath));
     if (relativeTargetPath.startsWith("..")) {
       return;
+    }
+
+    const appliedContextReferenceMarkers = getAppliedContextReferenceMarkersFromBranch(ctx.sessionManager);
+    const redundantContextReferenceReads = appliedContextReferenceMarkers.filter(
+      (marker) => absoluteTargetPath === marker.referenceRealPath || absoluteTargetPath === normalizePath(path.resolve(ctx.cwd, marker.referencePath)),
+    );
+    if (event.toolName === "read" && redundantContextReferenceReads.length > 0) {
+      const referenceLines = redundantContextReferenceReads.map((marker) => `- ${marker.referencePath}`).join("\n");
+      return {
+        block: true,
+        reason: `This Claude context reference file was already auto-read into context for the current branch:\n${referenceLines}\n\nDo not re-read it unless the user explicitly asks.`,
+      };
     }
 
     const appliedRuleMarkers = getAppliedRuleMarkersFromBranch(ctx.sessionManager);

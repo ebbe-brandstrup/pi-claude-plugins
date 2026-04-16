@@ -1,12 +1,13 @@
 # pi-claude-plugins
 
-A [pi](https://github.com/badlogic/pi-mono) extension that imports **enabled Claude plugin resources, Claude skills, Claude commands, and Claude path rules** into the current pi session.
+A [pi](https://github.com/badlogic/pi-mono) extension that imports **enabled Claude plugin resources, Claude skills, Claude commands, and Claude path rules** into the current pi session, and auto-expands `@file` references found inside project `AGENTS.md` / `CLAUDE.md` context files.
 
 It bridges Claude resources into pi by exposing:
 
 - **skills** as pi skills
 - **command markdown files** as pi prompt templates / slash commands
 - **Claude rules** as deterministic pre-read context for matching file paths
+- **`@file` references inside project `AGENTS.md` / `CLAUDE.md`** as hidden startup context injections
 
 The extension only loads plugins that are currently enabled in Claude after checking both:
 
@@ -40,6 +41,22 @@ The extension also loads command markdown files from:
 These are returned to pi as `promptPaths`, so they show up like pi prompt templates / slash commands.
 
 Before exposing Claude commands to pi, the extension writes sanitized temporary copies with pi-compatible frontmatter. This preserves Claude-specific command files while avoiding prompt-template parse failures from Claude-only frontmatter syntax.
+
+### Project context file references
+
+Pi already loads project `AGENTS.md` / `CLAUDE.md` files at startup. This extension adds Claude-like expansion of `@file` references found inside the project-root copies of those files.
+
+Behavior:
+
+- scans only project-root `AGENTS.md` and `CLAUDE.md` at `<cwd>/AGENTS.md` and `<cwd>/CLAUDE.md`
+- follows symlinks, but deduplicates by real file path
+- resolves `@path/to/file.md` relative to the project root (`<cwd>`)
+- recursively follows nested `@...` references
+- injects the referenced file contents into model context as hidden context material before the turn starts
+- shows a chat-visible audit message listing the injected file paths
+- blocks redundant later `read` calls for those already-injected referenced files unless the user explicitly asks
+
+Only references inside the project tree rooted at `<cwd>` are expanded; references outside the project root are ignored.
 
 ### Claude rules
 
@@ -194,6 +211,7 @@ On startup and on `/reload`, the extension:
 8. indexes project Claude rule files from `<cwd>/.claude/rules`
 9. filters out anything blocked by Claude settings or the bridge config
 10. returns the remaining skills / commands to pi via `resources_discover`
+11. before each turn, expands project-root `AGENTS.md` / `CLAUDE.md` `@file` references into hidden context messages
 
 For Claude rules, the extension also intercepts `read`, `edit`, and `write` tool calls. If a target path matches a rule's frontmatter `paths` globs, the extension:
 
@@ -204,6 +222,8 @@ For Claude rules, the extension also intercepts `read`, `edit`, and `write` tool
 5. lets the agent retry with the rules already in context
 
 Rule auto-reads are deduplicated per active branch, so rewinding to earlier history can re-trigger them when appropriate. If the model later tries to `read` a rule file that was already auto-read in the current branch, the extension blocks that redundant read and points back to the already-applied rule paths.
+
+Project `AGENTS.md` / `CLAUDE.md` `@file` reference injections are also deduplicated per active branch and block redundant later `read` calls for those already-injected referenced files.
 
 The extension also prints and notifies a summary like:
 
