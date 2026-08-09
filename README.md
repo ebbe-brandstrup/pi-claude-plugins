@@ -8,6 +8,7 @@ It bridges Claude resources into pi by exposing:
 - **command markdown files** as pi prompt templates / slash commands
 - **Claude rules** as deterministic pre-read context for matching file paths
 - **`@file` references inside project `AGENTS.md` / `CLAUDE.md`** as hidden startup context injections
+- **a context overview overlay** for Pi context files and Claude files auto-loaded in the active branch
 
 The extension only loads plugins that are currently enabled in Claude after checking both:
 
@@ -53,10 +54,24 @@ Behavior:
 - resolves `@path/to/file.md` relative to the project root (`<cwd>`)
 - recursively follows nested `@...` references
 - injects the referenced file contents into model context as hidden context material before the turn starts
-- shows a chat-visible audit message listing the injected file paths
+- records the injected paths in `/claude-context` without adding chat-visible audit messages
 - blocks redundant later `read` calls for those already-injected referenced files unless the user explicitly asks
 
 Only references inside the project tree rooted at `<cwd>` are expanded; references outside the project root are ignored.
+
+### Context overview
+
+Run `/claude-context` in an interactive Pi session to open a scrollable context overview overlay. It lists paths only; it never exposes file contents. The overlay grows to its content until it reaches the terminal height, keeps a one-row margin, and reflows when the terminal resizes.
+
+The overlay separates:
+
+- context files Pi has loaded into the current system prompt, including `AGENTS.md` and `CLAUDE.md`
+- `@file` references this extension has auto-loaded on the active session branch, with their referring context file
+- Claude path rules this extension has auto-loaded on the active branch, with the triggering tool and target path
+
+For symlinked rules, the overlay lists both the path matched under `.claude/rules` and the resolved source path, separated by an arrow.
+
+While it remains open, the overlay refreshes when this extension auto-loads a new `@file` reference or Claude rule. Use ↑/↓ to scroll, Page Up/Page Down to move by a page, Home/End to jump, and Enter or Escape to close the overlay.
 
 ### Claude rules
 
@@ -72,10 +87,10 @@ paths:
   - "tests/**"
 ```
 
-When the model uses `read`, `edit`, or `write` on a matching file path, the extension auto-reads each matching rule into context before the file operation proceeds.
+When the model uses `read`, `edit`, or `write` on a matching file path, the extension loads each newly applicable rule. A matching `read` returns the rules and requested source content together. A matching `edit` or `write` retries only when it caused a new rule to load; once its rules are already active, the mutation runs immediately.
 
 - rule file discovery and frontmatter path indexing refresh on `/reload`
-- rule markdown content itself is read fresh at trigger time, so content-only edits do not require `/reload`
+- rule markdown content is read fresh at trigger time; a changed rule body is loaded again on the active branch
 
 ## Install
 
@@ -213,15 +228,13 @@ On startup and on `/reload`, the extension:
 10. returns the remaining skills / commands to pi via `resources_discover`
 11. before each turn, expands project-root `AGENTS.md` / `CLAUDE.md` `@file` references into hidden context messages
 
-For Claude rules, the extension also intercepts `read`, `edit`, and `write` tool calls. If a target path matches a rule's frontmatter `paths` globs, the extension:
+For Claude rules, the extension intercepts `read`, `edit`, and `write` tool calls. If a target path matches a rule's frontmatter `paths` globs, it resolves and deduplicates the matching rules by canonical path and content hash.
 
-1. emits one chat-visible audit message per matched rule file
-2. injects the rule markdown into model context as a hidden context message
-3. explicitly frames that injected content as rule/context material rather than a new user request
-4. blocks the current file operation once
-5. lets the agent retry with the rules already in context
+- For `read`, it prepends each newly loaded rule and compact path-glob provenance to the requested file's tool result. The read runs once; it does not need a retry.
+- For `edit` and `write`, when new rules apply, it injects them as hidden context material, blocks the mutation once, and lets the agent retry with the constraints available. Once those rules are already active on the branch, matching mutations run immediately.
+- It records rule provenance in `/claude-context`, rather than emitting separate chat-visible audit messages.
 
-Rule auto-reads are deduplicated per active branch, so rewinding to earlier history can re-trigger them when appropriate. If the model later tries to `read` a rule file that was already auto-read in the current branch, the extension blocks that redundant read and points back to the already-applied rule paths.
+Rules loaded in the same parallel tool batch are injected once. Deduplication is scoped to the active branch so a branch that does not contain the original rule context can load it when needed. If the model later tries to `read` a rule file that was already auto-read in the current branch, the extension blocks that redundant read and points back to the already-applied rule paths.
 
 Project `AGENTS.md` / `CLAUDE.md` `@file` reference injections are also deduplicated per active branch and block redundant later `read` calls for those already-injected referenced files.
 

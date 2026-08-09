@@ -3,7 +3,8 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ExtensionAPI, ToolCallEvent } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, Theme, ToolCallEvent } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth, visibleWidth, type TUI } from "@earendil-works/pi-tui";
 
 const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const USER_CLAUDE_SKILLS_DIR = path.join(os.homedir(), ".claude", "skills");
@@ -14,10 +15,8 @@ const BRIDGE_CONFIG_PATH = path.join(PACKAGE_ROOT, "claude-plugin-bridge.json");
 const SANITIZED_PROMPTS_DIR = path.join(os.tmpdir(), "pi-claude-plugins", "prompts");
 const DEBUG = process.env.PI_CLAUDE_PLUGINS_DEBUG === "1";
 const RULE_AUTO_READ_MESSAGE_TYPE = "claude-rule-auto-read";
-const RULE_AUTO_READ_AUDIT_MESSAGE_TYPE = "claude-rule-auto-read-audit";
 const RULE_AUTO_READ_MARKER_TYPE = "claude-rule-auto-read-marker";
 const CONTEXT_REFERENCE_AUTO_READ_MESSAGE_TYPE = "context-reference-auto-read";
-const CONTEXT_REFERENCE_AUTO_READ_AUDIT_MESSAGE_TYPE = "context-reference-auto-read-audit";
 const CONTEXT_REFERENCE_AUTO_READ_MARKER_TYPE = "context-reference-auto-read-marker";
 const IGNORED_DIRECTORY_NAMES = new Set(["node_modules", "build", "dist", "out"]);
 const GLOB_WILDCARD_RE = /[*?[]/;
@@ -88,7 +87,16 @@ type RuleAutoReadMarker = {
   ruleRealPath: string;
   rulePath: string;
   sourcePath: string;
+  contentHash?: string;
   triggeredByTool: string;
+  targetPath: string;
+};
+
+type PendingRuleAutoRead = {
+  rule: RuleDefinition;
+  content: string;
+  contentHash: string;
+  matchingGlobs: string[];
   targetPath: string;
 };
 
@@ -646,6 +654,26 @@ async function loadRuleIndex(cwd: string, config: BridgeConfig): Promise<RuleMat
   };
 }
 
+function ruleGlobMatchesPath(rulePathGlob: string, targetRelativePath: string): boolean {
+  const normalizedGlob = normalizeRelativePath(rulePathGlob);
+  const normalizedTarget = normalizeRelativePath(targetRelativePath);
+
+  if (!GLOB_WILDCARD_RE.test(normalizedGlob)) {
+    return normalizedGlob === normalizedTarget;
+  }
+
+  if (normalizedGlob.endsWith("/**") && !GLOB_WILDCARD_RE.test(normalizedGlob.slice(0, -3))) {
+    const prefix = normalizedGlob.slice(0, -3);
+    return normalizedTarget === prefix || normalizedTarget.startsWith(`${prefix}/`);
+  }
+
+  return globToRegExp(normalizedGlob).test(normalizedTarget);
+}
+
+function getMatchingRuleGlobs(rule: RuleDefinition, targetRelativePath: string): string[] {
+  return rule.paths.filter((rulePathGlob) => ruleGlobMatchesPath(rulePathGlob, targetRelativePath));
+}
+
 function getMatchingRules(index: RuleMatchIndex, targetRelativePath: string): RuleDefinition[] {
   const normalizedTarget = normalizeRelativePath(targetRelativePath);
   const cached = index.matchCache.get(normalizedTarget);
@@ -802,6 +830,7 @@ function getAppliedRuleMarkersFromBranch(sessionManager: { getBranch(): unknown[
       applied.push({
         ...data,
         ruleRealPath: normalizePath(data.ruleRealPath),
+        contentHash: typeof data.contentHash === "string" ? data.contentHash : undefined,
       });
     }
   }
@@ -811,6 +840,10 @@ function getAppliedRuleMarkersFromBranch(sessionManager: { getBranch(): unknown[
 
 async function readRuleContent(rule: RuleDefinition): Promise<string> {
   return await readFile(rule.rulePath, "utf8");
+}
+
+function hashRuleContent(content: string): string {
+  return crypto.createHash("sha256").update(content).digest("hex");
 }
 
 async function discoverContextReferenceSources(cwd: string): Promise<ContextReferenceSource[]> {
@@ -926,11 +959,6 @@ function formatContextReferenceAutoReadContextMessage(files: ContextReferenceFil
   ].join("\n");
 }
 
-function formatContextReferenceAutoReadAuditMessage(files: ContextReferenceFile[]): string {
-  const lines = files.map((file) => `- ${file.displayPath}`);
-  return `Auto-read Claude context file references:\n${lines.join("\n")}`;
-}
-
 function formatRuleAutoReadContextMessage(rule: RuleDefinition, toolName: string, targetPath: string, content: string): string {
   const sourceNote = rule.displayPath === rule.sourceDisplayPath ? "" : `\nSource: ${rule.sourceDisplayPath}`;
   return [
@@ -943,12 +971,234 @@ function formatRuleAutoReadContextMessage(rule: RuleDefinition, toolName: string
   ].join("\n");
 }
 
-function formatRuleAutoReadAuditMessage(rule: RuleDefinition, toolName: string, targetPath: string): string {
-  const sourceLine = rule.displayPath === rule.sourceDisplayPath ? "" : `\nSource: ${rule.sourceDisplayPath}`;
-  return `Auto-read Claude rule before ${toolName}: ${rule.displayPath}\nTarget: ${targetPath}${sourceLine}`;
+function formatReadRulePrefix(rules: PendingRuleAutoRead[]): string {
+  const provenance = rules.map(({ rule, matchingGlobs, targetPath }) => {
+    const source = rule.displayPath === rule.sourceDisplayPath ? "" : ` → ${rule.sourceDisplayPath}`;
+    return `- ${rule.displayPath}${source} via ${matchingGlobs.join(", ")} for ${targetPath}`;
+  });
+  const sections = rules.map(({ rule, content }) => {
+    const source = rule.displayPath === rule.sourceDisplayPath ? "" : `\nSource: ${rule.sourceDisplayPath}`;
+    return [`## Rule: ${rule.displayPath}${source}`, "", content.trim()].join("\n");
+  });
+
+  return [
+    "Claude rules newly loaded for this read:",
+    ...provenance,
+    "",
+    "Treat the following as constraints and guidance. The requested file content follows these rules.",
+    "",
+    ...sections,
+    "",
+    "Requested file:",
+  ].join("\n");
+}
+
+type ContextOverviewRule = Pick<RuleAutoReadMarker, "ruleRealPath" | "rulePath" | "sourcePath" | "triggeredByTool" | "targetPath">;
+type ContextOverviewReference = Pick<ContextReferenceAutoReadMarker, "referenceRealPath" | "referencePath" | "sourcePath">;
+
+type ContextOverview = {
+  piContextPaths: string[];
+  references: ContextOverviewReference[];
+  rules: ContextOverviewRule[];
+};
+
+function uniqueBy<T>(items: T[], key: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const itemKey = key(item);
+    if (seen.has(itemKey)) return false;
+    seen.add(itemKey);
+    return true;
+  });
+}
+
+function getContextOverview(ctx: ExtensionCommandContext): ContextOverview {
+  // Pi supplies these in the same order it concatenates them into the system prompt.
+  const piContextPaths = (ctx.getSystemPromptOptions().contextFiles ?? []).map((file) => file.path);
+
+  const references = uniqueBy(
+    getAppliedContextReferenceMarkersFromBranch(ctx.sessionManager)
+      .map((marker) => ({
+        referenceRealPath: marker.referenceRealPath,
+        referencePath: marker.referencePath,
+        sourcePath: marker.sourcePath,
+      }))
+      .sort((a, b) => a.referencePath.localeCompare(b.referencePath)),
+    (marker) => marker.referenceRealPath,
+  );
+
+  const rules = uniqueBy(
+    getAppliedRuleMarkersFromBranch(ctx.sessionManager)
+      .map((marker) => ({
+        ruleRealPath: marker.ruleRealPath,
+        rulePath: marker.rulePath,
+        sourcePath: marker.sourcePath,
+        triggeredByTool: marker.triggeredByTool,
+        targetPath: marker.targetPath,
+      }))
+      .sort((a, b) => a.rulePath.localeCompare(b.rulePath)),
+    (marker) => marker.ruleRealPath,
+  );
+
+  return { piContextPaths, references, rules };
+}
+
+function buildContextOverviewLines(overview: ContextOverview): string[] {
+  const lines: string[] = [];
+  const addSection = (title: string, count: number, emptyMessage: string) => {
+    if (lines.length > 0) lines.push("");
+    lines.push(`${title} (${count})`);
+    if (count === 0) lines.push(`  ${emptyMessage}`);
+  };
+
+  addSection("Pi context files in the system prompt", overview.piContextPaths.length, "None reported by Pi.");
+  for (const contextPath of overview.piContextPaths) {
+    lines.push(`  • ${contextPath}`);
+  }
+
+  addSection("Claude @file references auto-loaded on this branch", overview.references.length, "No references have been injected.");
+  for (const reference of overview.references) {
+    const source = reference.referencePath === reference.sourcePath ? "" : ` ← ${reference.sourcePath}`;
+    lines.push(`  • ${reference.referencePath}${source}`);
+  }
+
+  addSection("Claude path rules auto-loaded on this branch", overview.rules.length, "No rules have been injected.");
+  for (const rule of overview.rules) {
+    const source = rule.rulePath === rule.sourcePath ? "" : ` → ${rule.sourcePath}`;
+    lines.push(`  • ${rule.rulePath}${source} — ${rule.triggeredByTool}: ${rule.targetPath}`);
+  }
+
+  return lines;
+}
+
+class ContextOverviewComponent {
+  private static readonly chromeRows = 7;
+  private static readonly verticalMargin = 1;
+  private scrollOffset = 0;
+  private lines: string[];
+
+  constructor(
+    private readonly tui: TUI,
+    private readonly theme: Theme,
+    private readonly getLines: () => string[],
+    private readonly done: () => void,
+  ) {
+    this.lines = getLines();
+  }
+
+  refresh(): void {
+    this.lines = this.getLines();
+    this.tui.requestRender();
+  }
+
+  private refreshLines(): void {
+    this.lines = this.getLines();
+  }
+
+  private getPageSize(): number {
+    const availableRows = this.tui.terminal.rows - ContextOverviewComponent.verticalMargin * 2;
+    const maxContentRows = Math.max(1, availableRows - ContextOverviewComponent.chromeRows);
+    return Math.min(this.lines.length, maxContentRows);
+  }
+
+  handleInput(data: string): void {
+    this.refreshLines();
+    const pageSize = this.getPageSize();
+    const maxOffset = Math.max(0, this.lines.length - pageSize);
+
+    if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c") || matchesKey(data, "return")) {
+      this.done();
+      return;
+    }
+
+    if (matchesKey(data, "up")) this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+    else if (matchesKey(data, "down")) this.scrollOffset = Math.min(maxOffset, this.scrollOffset + 1);
+    else if (matchesKey(data, "pageUp")) this.scrollOffset = Math.max(0, this.scrollOffset - pageSize);
+    else if (matchesKey(data, "pageDown")) this.scrollOffset = Math.min(maxOffset, this.scrollOffset + pageSize);
+    else if (matchesKey(data, "home")) this.scrollOffset = 0;
+    else if (matchesKey(data, "end")) this.scrollOffset = maxOffset;
+    else return;
+
+    this.tui.requestRender();
+  }
+
+  render(width: number): string[] {
+    this.refreshLines();
+    const innerWidth = Math.max(1, width - 2);
+    const border = (text: string) => this.theme.fg("border", text);
+    const pad = (text: string) => {
+      const truncated = truncateToWidth(text, innerWidth, "...", true);
+      return truncated + " ".repeat(Math.max(0, innerWidth - visibleWidth(truncated)));
+    };
+    const row = (text: string) => `${border("│")}${pad(text)}${border("│")}`;
+    const pageSize = this.getPageSize();
+    const maxOffset = Math.max(0, this.lines.length - pageSize);
+    this.scrollOffset = Math.min(this.scrollOffset, maxOffset);
+    const visibleLines = this.lines.slice(this.scrollOffset, this.scrollOffset + pageSize);
+    const position = this.lines.length > pageSize ? ` ${this.scrollOffset + 1}-${this.scrollOffset + visibleLines.length}/${this.lines.length}` : "";
+
+    const rendered = [
+      border(`╭${"─".repeat(innerWidth)}╮`),
+      row(` ${this.theme.fg("accent", this.theme.bold("Context overview"))}${this.theme.fg("dim", position)}`),
+      row(` ${this.theme.fg("dim", "Pi system context and this branch's automatic Claude injections")}`),
+      border(`├${"─".repeat(innerWidth)}┤`),
+    ];
+
+    rendered.push(...visibleLines.map((line) => row(line)));
+    while (rendered.length < pageSize + 4) rendered.push(row(""));
+    rendered.push(border(`├${"─".repeat(innerWidth)}┤`));
+    rendered.push(row(` ${this.theme.fg("dim", "↑↓ scroll • PgUp/PgDn page • Home/End • Enter/Esc close")}`));
+    rendered.push(border(`╰${"─".repeat(innerWidth)}╯`));
+    return rendered;
+  }
+
+  invalidate(): void {}
 }
 
 export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
+  let activeContextOverview: ContextOverviewComponent | undefined;
+
+  pi.registerCommand("claude-context", {
+    description: "Show Pi context files and Claude files auto-loaded on this branch",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("/claude-context is available in interactive Pi sessions only.", "info");
+        return;
+      }
+
+      let component: ContextOverviewComponent | undefined;
+      try {
+        await ctx.ui.custom<void>(
+          (tui, theme, _keybindings, done) => {
+            component = new ContextOverviewComponent(
+              tui,
+              theme,
+              () => buildContextOverviewLines(getContextOverview(ctx)),
+              done,
+            );
+            activeContextOverview = component;
+            return component;
+          },
+          {
+            overlay: true,
+            overlayOptions: {
+              anchor: "center",
+              width: "75%",
+              minWidth: 50,
+              // This is clamped to the available terminal height on every render.
+              maxHeight: "100%",
+              margin: 1,
+            },
+          },
+        );
+      } finally {
+        if (activeContextOverview === component) {
+          activeContextOverview = undefined;
+        }
+      }
+    },
+  });
+
   let activeRuleIndex: RuleMatchIndex = {
     rulesDir: getProjectClaudeRulesDir(process.cwd()),
     rules: [],
@@ -958,6 +1208,7 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
     matchCache: new Map(),
   };
   let currentTurnPendingRulePaths = new Set<string>();
+  let pendingReadRules = new Map<string, PendingRuleAutoRead[]>();
 
   async function refreshRuleIndex(cwd: string): Promise<void> {
     const config = await loadBridgeConfig();
@@ -989,6 +1240,7 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     try {
       currentTurnPendingRulePaths = new Set();
+      pendingReadRules = new Map();
       await refreshRuleIndex(ctx.cwd);
 
       const resources = await discoverResources(ctx.cwd);
@@ -1000,7 +1252,7 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
           : `[claude-marketplace-skills] No enabled skill or command files found in Claude plugins, skills, or commands`;
 
       if (ctx.hasUI) {
-        ctx.ui.notify(message, skillCount > 0 || promptCount > 0 ? "success" : "warning");
+        ctx.ui.notify(message, skillCount > 0 || promptCount > 0 ? "info" : "warning");
       } else {
         console.log(`${message}\n`);
       }
@@ -1052,18 +1304,6 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
         { deliverAs: "steer" },
       );
 
-      pi.sendMessage(
-        {
-          customType: CONTEXT_REFERENCE_AUTO_READ_AUDIT_MESSAGE_TYPE,
-          content: formatContextReferenceAutoReadAuditMessage(filesToInject),
-          display: true,
-          details: {
-            paths: filesToInject.map((file) => file.displayPath),
-          },
-        },
-        { deliverAs: "steer" },
-      );
-
       for (const file of filesToInject) {
         pi.appendEntry<ContextReferenceAutoReadMarker>(CONTEXT_REFERENCE_AUTO_READ_MARKER_TYPE, {
           referenceRealPath: file.realPath,
@@ -1071,6 +1311,7 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
           sourcePath: file.sourceDisplayPath,
         });
       }
+      activeContextOverview?.refresh();
 
     } catch (error) {
       const message = `[claude-marketplace-skills] Failed to expand Claude context file references: ${(error as Error).message}`;
@@ -1084,10 +1325,36 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
 
   pi.on("turn_start", async () => {
     currentTurnPendingRulePaths = new Set();
+    pendingReadRules = new Map();
   });
 
   pi.on("turn_end", async () => {
     currentTurnPendingRulePaths = new Set();
+    pendingReadRules = new Map();
+  });
+
+  pi.on("tool_result", async (event) => {
+    const rules = pendingReadRules.get(event.toolCallId);
+    if (!rules) {
+      return;
+    }
+
+    pendingReadRules.delete(event.toolCallId);
+    for (const pendingRule of rules) {
+      pi.appendEntry<RuleAutoReadMarker>(RULE_AUTO_READ_MARKER_TYPE, {
+        ruleRealPath: pendingRule.rule.realPath,
+        rulePath: pendingRule.rule.displayPath,
+        sourcePath: pendingRule.rule.sourceDisplayPath,
+        contentHash: pendingRule.contentHash,
+        triggeredByTool: "read",
+        targetPath: pendingRule.targetPath,
+      });
+    }
+    activeContextOverview?.refresh();
+
+    return {
+      content: [{ type: "text", text: formatReadRulePrefix(rules) }, ...event.content],
+    };
   });
 
   pi.on("tool_call", async (event, ctx) => {
@@ -1115,8 +1382,6 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
     }
 
     const appliedRuleMarkers = getAppliedRuleMarkersFromBranch(ctx.sessionManager);
-    const appliedRuleRealPaths = new Set(appliedRuleMarkers.map((marker) => marker.ruleRealPath));
-
     const redundantRuleReads = appliedRuleMarkers.filter(
       (marker) => absoluteTargetPath === normalizePath(path.resolve(ctx.cwd, marker.rulePath)) || absoluteTargetPath === normalizePath(path.resolve(ctx.cwd, marker.sourcePath)),
     );
@@ -1133,68 +1398,89 @@ export default function claudeMarketplaceSkills(pi: ExtensionAPI) {
       return;
     }
 
-    const rulesToInject = matchingRules.filter(
-      (rule) => !appliedRuleRealPaths.has(rule.realPath) && !currentTurnPendingRulePaths.has(rule.realPath),
-    );
+    const rulesToInject: PendingRuleAutoRead[] = [];
+    for (const rule of matchingRules) {
+      if (currentTurnPendingRulePaths.has(rule.realPath)) {
+        continue;
+      }
+
+      const content = await readRuleContent(rule);
+      const contentHash = hashRuleContent(content);
+      const alreadyApplied = appliedRuleMarkers.some(
+        (marker) => marker.ruleRealPath === rule.realPath && (marker.contentHash === undefined || marker.contentHash === contentHash),
+      );
+      if (alreadyApplied) {
+        continue;
+      }
+
+      currentTurnPendingRulePaths.add(rule.realPath);
+      rulesToInject.push({
+        rule,
+        content,
+        contentHash,
+        matchingGlobs: getMatchingRuleGlobs(rule, relativeTargetPath),
+        targetPath: relativeTargetPath,
+      });
+    }
 
     if (rulesToInject.length === 0) {
       return;
     }
 
-    for (const rule of rulesToInject) {
-      currentTurnPendingRulePaths.add(rule.realPath);
-      const ruleContent = await readRuleContent(rule);
+    if (event.toolName === "read") {
+      pendingReadRules.set(event.toolCallId, rulesToInject);
+      if (DEBUG) {
+        console.log(
+          `[claude-marketplace-skills] Loading ${rulesToInject.length} Claude rule file${rulesToInject.length === 1 ? "" : "s"} with read: ${rulesToInject.map(({ rule }) => rule.displayPath).join(", ")} for ${relativeTargetPath}\n`,
+        );
+      }
+      return;
+    }
 
-      pi.sendMessage(
-        {
-          customType: RULE_AUTO_READ_MESSAGE_TYPE,
-          content: formatRuleAutoReadContextMessage(rule, event.toolName, relativeTargetPath, ruleContent),
-          display: false,
-          details: {
-            rulePath: rule.displayPath,
-            sourcePath: rule.sourceDisplayPath,
-            targetPath: relativeTargetPath,
-            toolName: event.toolName,
-          },
-        },
-        { deliverAs: "steer" },
-      );
-
-      pi.sendMessage(
-        {
-          customType: RULE_AUTO_READ_AUDIT_MESSAGE_TYPE,
-          content: formatRuleAutoReadAuditMessage(rule, event.toolName, relativeTargetPath),
-          display: true,
-          details: {
-            rulePath: rule.displayPath,
-            sourcePath: rule.sourceDisplayPath,
-            targetPath: relativeTargetPath,
-            toolName: event.toolName,
-          },
-        },
-        { deliverAs: "steer" },
-      );
-
+    for (const pendingRule of rulesToInject) {
       pi.appendEntry<RuleAutoReadMarker>(RULE_AUTO_READ_MARKER_TYPE, {
-        ruleRealPath: rule.realPath,
-        rulePath: rule.displayPath,
-        sourcePath: rule.sourceDisplayPath,
+        ruleRealPath: pendingRule.rule.realPath,
+        rulePath: pendingRule.rule.displayPath,
+        sourcePath: pendingRule.rule.sourceDisplayPath,
+        contentHash: pendingRule.contentHash,
         triggeredByTool: event.toolName,
         targetPath: relativeTargetPath,
       });
-
     }
+    activeContextOverview?.refresh();
 
     if (DEBUG) {
       console.log(
-        `[claude-marketplace-skills] Auto-read ${rulesToInject.length} Claude rule file${rulesToInject.length === 1 ? "" : "s"} before ${event.toolName}: ${rulesToInject.map((rule) => rule.displayPath).join(", ")} for ${relativeTargetPath}\n`,
+        `[claude-marketplace-skills] Auto-read ${rulesToInject.length} Claude rule file${rulesToInject.length === 1 ? "" : "s"} before ${event.toolName}: ${rulesToInject.map(({ rule }) => rule.displayPath).join(", ")} for ${relativeTargetPath}\n`,
       );
     }
 
-    const injectedRuleLines = rulesToInject.map((rule) => `- ${rule.displayPath}`).join("\n");
+    for (const pendingRule of rulesToInject) {
+      pi.sendMessage(
+        {
+          customType: RULE_AUTO_READ_MESSAGE_TYPE,
+          content: formatRuleAutoReadContextMessage(
+            pendingRule.rule,
+            event.toolName,
+            relativeTargetPath,
+            pendingRule.content,
+          ),
+          display: false,
+          details: {
+            rulePath: pendingRule.rule.displayPath,
+            sourcePath: pendingRule.rule.sourceDisplayPath,
+            targetPath: relativeTargetPath,
+            toolName: event.toolName,
+          },
+        },
+        { deliverAs: "steer" },
+      );
+    }
+
+    const injectedRuleLines = rulesToInject.map(({ rule }) => `- ${rule.displayPath}`).join("\n");
     return {
       block: true,
-      reason: `Auto-read Claude rules for ${relativeTargetPath}:\n${injectedRuleLines}\n\nRetry now that these rules are already in context. Do not re-read them unless the user explicitly asks.`,
+      reason: `Auto-read Claude rules for ${relativeTargetPath}:\n${injectedRuleLines}\n\nRetry now that these rules are already in context.`,
     };
   });
 }
